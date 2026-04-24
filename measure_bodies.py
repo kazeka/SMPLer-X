@@ -11,6 +11,8 @@ Usage:
     python measure_bodies.py demo/results/myvideo/ --model_path common/utils/human_model_files
 """
 
+from __future__ import annotations
+
 import argparse
 import glob
 import os
