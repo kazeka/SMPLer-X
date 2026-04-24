@@ -20,6 +20,7 @@ import sys
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 # SMPL-X orig_joint_part body joint indices (from common/utils/human_models.py):
 #   0  Pelvis      1  L_Hip       2  R_Hip
@@ -164,7 +165,7 @@ def main():
         k: [] for k in ("height", "chest", "waist", "hips", "shoulder_width", "arm_span")
     }
 
-    for path in npz_files:
+    for path in tqdm(npz_files, desc="Processing detections", unit="det"):
         betas = load_betas(path)
         all_betas.append(betas)
         verts, joints = tpose_mesh(model, betas)
