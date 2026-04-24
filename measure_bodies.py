@@ -44,8 +44,11 @@ def load_smplx(model_path: str):
     except ImportError:
         sys.exit("smplx not installed. Run: pip install smplx")
 
-    return smplx.create(
-        model_path, "smplx",
+    # Use SMPLX directly rather than smplx.create(), which infers model type
+    # from the path string and misidentifies 'human_model_files' as 'human'.
+    smplx_dir = os.path.join(model_path, "smplx")
+    return smplx.SMPLX(
+        smplx_dir,
         gender="neutral",
         num_betas=10,
         use_face_contour=True,
@@ -137,8 +140,10 @@ def print_stats(label: str, values_m: list[float]) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Body measurement averages from SMPLer-X results")
     parser.add_argument("results_dir", help="Path to demo/results/{VIDEO_NAME}/")
-    parser.add_argument("--model_path", default="common/utils/human_model_files",
-                        help="Path to SMPL-X model files (default: common/utils/human_model_files)")
+    _repo_root = os.path.dirname(os.path.abspath(__file__))
+    _default_model_path = os.path.join(_repo_root, "common", "utils", "human_model_files")
+    parser.add_argument("--model_path", default=_default_model_path,
+                        help="Path to SMPL-X model files")
     parser.add_argument("--mean_betas", action="store_true",
                         help="Also show measurements for the mean betas across all detections")
     args = parser.parse_args()
