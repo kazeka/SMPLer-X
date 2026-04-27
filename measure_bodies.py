@@ -18,6 +18,7 @@ import glob
 import os
 import sys
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -129,6 +130,56 @@ def load_betas(npz_path: str) -> np.ndarray:
     return data["betas"].reshape(10).astype(np.float32)
 
 
+def frame_index(npz_path: str) -> int:
+    """Extract frame number from filename, e.g. '00042_1.npz' → 42."""
+    return int(os.path.basename(npz_path).split("_")[0])
+
+
+def plot_measurements(
+    frame_indices: list[int],
+    per_detection: dict[str, list[float]],
+    save_path: str,
+    window: int = 30,
+) -> None:
+    keys = list(per_detection.keys())
+    n = len(keys)
+    ncols = 2
+    nrows = (n + 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, nrows * 3), sharex=True)
+    axes = axes.flatten()
+
+    frames = np.array(frame_indices)
+
+    for ax, key in zip(axes, keys):
+        vals_mm = np.array(per_detection[key]) * 1000
+        ax.scatter(frames, vals_mm, s=4, alpha=0.35, color="steelblue", label="per detection")
+
+        # rolling mean (sorted by frame index)
+        order = np.argsort(frames)
+        f_sorted = frames[order]
+        v_sorted = vals_mm[order]
+        if len(v_sorted) >= window:
+            kernel = np.ones(window) / window
+            rolling = np.convolve(v_sorted, kernel, mode="valid")
+            ax.plot(f_sorted[window - 1:], rolling, color="crimson", linewidth=1.5, label=f"rolling mean (w={window})")
+
+        ax.set_title(key.replace("_", " ").title())
+        ax.set_ylabel("mm")
+        ax.legend(fontsize=7, loc="upper right")
+        ax.grid(True, linewidth=0.4, alpha=0.5)
+
+    for ax in axes[n:]:
+        ax.set_visible(False)
+
+    for ax in axes[(nrows - 1) * ncols: n]:
+        ax.set_xlabel("frame index")
+
+    fig.suptitle("Body measurements vs frame index", fontsize=13, y=1.01)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=120, bbox_inches="tight")
+    print(f"Plot saved to {save_path}")
+
+
 def print_stats(label: str, values_m: list[float]) -> None:
     if not values_m:
         print(f"  {label:<18}: no data")
@@ -147,6 +198,10 @@ def main():
                         help="Path to SMPL-X model files")
     parser.add_argument("--mean_betas", action="store_true",
                         help="Also show measurements for the mean betas across all detections")
+    parser.add_argument("--no-plot", dest="no_plot", action="store_true",
+                        help="Skip saving the measurements plot")
+    parser.add_argument("--rolling-window", type=int, default=30, metavar="N",
+                        help="Rolling mean window size for the plot (default: 30)")
     args = parser.parse_args()
 
     smplx_dir = os.path.join(args.results_dir, "smplx")
@@ -161,6 +216,7 @@ def main():
     faces = model.faces  # (N_faces, 3) int array
 
     all_betas = []
+    frame_indices: list[int] = []
     per_detection: dict[str, list[float]] = {
         k: [] for k in ("height", "chest", "waist", "hips", "shoulder_width", "arm_span")
     }
@@ -168,6 +224,7 @@ def main():
     for path in tqdm(npz_files, desc="Processing detections", unit="det"):
         betas = load_betas(path)
         all_betas.append(betas)
+        frame_indices.append(frame_index(path))
         verts, joints = tpose_mesh(model, betas)
         m = measure(verts, joints, faces)
         for k, v in m.items():
@@ -177,6 +234,10 @@ def main():
     print("\n=== Per-detection averages ===")
     for key in per_detection:
         print_stats(key, per_detection[key])
+
+    if not args.no_plot:
+        plot_path = os.path.join(args.results_dir, "measurements.png")
+        plot_measurements(frame_indices, per_detection, plot_path, window=args.rolling_window)
 
     if args.mean_betas:
         mean_betas = np.mean(all_betas, axis=0)
