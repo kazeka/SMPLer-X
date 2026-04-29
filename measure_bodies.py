@@ -1,14 +1,27 @@
 """
-Compute average body measurements (mm) from SMPLer-X inference results.
+Compute body measurements (mm) from SMPLer-X / SMPLest-X inference results.
 
-No camera calibration required: SMPL-X shape betas encode body dimensions in
-absolute metric units. We run the model in T-pose (all joints zeroed) so
-measurements reflect body shape alone, independent of the captured pose or
-camera parameters. The saved `transl` values are intentionally ignored.
+No camera calibration required for the measurement step: SMPL-X shape `betas`
+encode body proportions in absolute metric units (metres) on a canonical mesh.
+We run the model in T-pose (all joint rotations zeroed) so measurements
+reflect body shape alone, independent of the captured pose. The saved `transl`
+values are intentionally ignored.
+
+The pipeline aggregates `betas` across detections rather than aggregating
+per-frame measurements: for a single subject, `betas` should be constant
+across frames, and inter-frame variability is regression noise. Median-betas
+aggregation with outlier rejection is more robust than averaging per-frame
+measurements because per-frame errors are correlated (one bad frame produces
+bad measurements for everything together) and surface as outliers in
+shape-parameter space where they can be detected and rejected.
+
+See MEASUREMENTS.md for the full methodology, anatomical assumptions, and
+sourcing.
 
 Usage:
     python measure_bodies.py demo/results/myvideo/
     python measure_bodies.py demo/results/myvideo/ --model_path common/utils/human_model_files
+    python measure_bodies.py demo/results/myvideo/ --aggregation median_betas
 """
 
 from __future__ import annotations
@@ -23,24 +36,49 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-# SMPL-X orig_joint_part body joint indices (from common/utils/human_models.py):
-#   0  Pelvis      1  L_Hip       2  R_Hip
-#   3  Spine_1     4  L_Knee      5  R_Knee
-#   6  Spine_2     7  L_Ankle     8  R_Ankle
-#   9  Spine_3    10  L_Foot     11  R_Foot
-#  12  Neck       13  L_Collar   14  R_Collar
-#  15  Head       16  L_Shoulder 17  R_Shoulder
-#  18  L_Elbow    19  R_Elbow    20  L_Wrist    21  R_Wrist
+# ---------------------------------------------------------------------------
+# SMPL-X body joint indices (first 22 entries of the joints output array).
+#
+# Canonical reference: vchoutas/smplx joint_names.py
+#     https://github.com/vchoutas/smplx/blob/main/smplx/joint_names.py
+# Cross-referenced with Meshcapade SMPL wiki:
+#     https://github.com/Meshcapade/wiki/blob/main/wiki/SMPL.md
+#
+# Indexing is identical between SMPL, SMPL+H and SMPL-X for the first 22
+# body joints. SMPL-X with use_face_contour=True returns 144 joints total
+# (127 default + 17 face contour landmarks); only the first 22 are used here.
+#
+#   0  pelvis        1  left_hip      2  right_hip
+#   3  spine1        4  left_knee     5  right_knee
+#   6  spine2        7  left_ankle    8  right_ankle
+#   9  spine3       10  left_foot    11  right_foot
+#  12  neck         13  left_collar  14  right_collar
+#  15  head         16  left_shoulder 17  right_shoulder
+#  18  left_elbow   19  right_elbow  20  left_wrist  21  right_wrist
+#
+# Anatomical note: spine1/spine2/spine3 are linear-blend-skinning anchors
+# fit to bulk torso deformation during model training. They are NOT
+# anatomical landmarks and do NOT correspond to specific vertebrae. Their
+# heights drift with body proportions. See MEASUREMENTS.md §4.
+# ---------------------------------------------------------------------------
 PELVIS      = 0
 L_HIP, R_HIP = 1, 2
-SPINE_2     = 6
-SPINE_3     = 9
+SPINE_1     = 3   # ~58–62% of stature; lower lumbar / iliac crest area
+SPINE_2     = 6   # ~65–70% of stature; lower thoracic / floating-rib level
+SPINE_3     = 9   # ~76–80% of stature; upper thoracic / scapular level
 NECK        = 12
 L_SHOULDER, R_SHOULDER = 16, 17
+L_ELBOW, R_ELBOW       = 18, 19
 L_WRIST, R_WRIST       = 20, 21
 
 
 def load_smplx(model_path: str, gender: str = "neutral"):
+    """Load the SMPL-X body model from disk.
+
+    use_face_contour=True expands the joints output from 127 to 144 by
+    appending 17 dynamic face contour landmarks. We don't use these for
+    measurement, but the inference pipeline upstream may rely on them.
+    """
     try:
         import smplx
     except ImportError:
@@ -61,68 +99,238 @@ def load_smplx(model_path: str, gender: str = "neutral"):
 
 
 def tpose_mesh(model, betas: np.ndarray):
-    """Forward pass with zero pose, returning (vertices, joints) in metres."""
+    """Forward pass with zero pose, returning (vertices, joints) in metres.
+
+    All joint rotations, hand/jaw/eye poses, and expression parameters are
+    left at zero — only `betas` drives the output. This produces the
+    canonical T-pose mesh whose geometry depends solely on body shape.
+    """
     b = torch.tensor(betas.reshape(1, 10), dtype=torch.float32)
     with torch.no_grad():
         out = model(betas=b, return_verts=True)
     return out.vertices.squeeze().numpy(), out.joints.squeeze().numpy()
 
 
-def cross_section_perimeter(vertices: np.ndarray, faces: np.ndarray, y: float) -> float | None:
+def _contour_perimeters(vertices: np.ndarray, faces: np.ndarray, y: float) -> list[float]:
     """
-    Exact cross-section perimeter at height `y` by intersecting every
-    mesh triangle with the horizontal plane and summing edge lengths.
-    Returns metres, or None if the plane misses the mesh.
-    """
-    total = 0.0
-    count = 0
-    for tri_idx in faces:
-        tri = vertices[tri_idx]          # (3, 3)
-        above = tri[:, 1] > y
+    Find all closed contours formed by intersecting horizontal plane Y=y with
+    the mesh, and return their individual perimeters.
 
-        pts = []
+    Each triangle that straddles the plane contributes a single line segment
+    (entry crossing → exit crossing). Stitching these segments end-to-end via
+    shared crossing points reconstructs each closed contour around the body
+    cross-section.
+
+    Why we need this: at certain Y values the plane intersects the mesh in
+    multiple disjoint loops (e.g. just below the armpits, where one loop goes
+    around the torso and two more loops go around each upper arm). Naively
+    summing all segment lengths conflates these into one bogus perimeter.
+    Returning the *list* of contour perimeters lets the caller pick the right
+    one (typically the largest = torso).
+
+    The "0 or 2 crossings per triangle" invariant comes from the topology of
+    a plane cutting a triangle: it must enter through one edge and exit
+    through another, or graze a vertex (treated as no crossing).
+    """
+    # Collect line segments contributed by each straddling triangle.
+    # Each segment is a pair of 3D points (entry, exit) on the slice plane.
+    segments: list[tuple[np.ndarray, np.ndarray]] = []
+
+    for tri_idx in faces:
+        tri = vertices[tri_idx]                # (3, 3)
+        above = tri[:, 1] > y
+        # Skip degenerate cases: all-above or all-below means no crossing.
+        if above.all() or not above.any():
+            continue
+
+        crossings: list[np.ndarray] = []
         for i in range(3):
             j = (i + 1) % 3
             if above[i] != above[j]:
+                # Linear interpolation along the edge:
+                # solve y = y_i + t * (y_j - y_i) for t, then interpolate the
+                # full 3D position at that fraction along the edge.
                 t = (y - tri[i, 1]) / (tri[j, 1] - tri[i, 1])
-                pts.append(tri[i] + t * (tri[j] - tri[i]))
+                crossings.append(tri[i] + t * (tri[j] - tri[i]))
 
-        if len(pts) == 2:
-            total += np.linalg.norm(pts[1] - pts[0])
-            count += 1
+        # Topological invariant: a triangle straddling a plane must produce
+        # exactly 2 crossings. Anything else means the input mesh is degenerate
+        # (zero-area triangle, vertex exactly on the plane, etc.).
+        assert len(crossings) == 2, (
+            f"Triangle has {len(crossings)} crossings at y={y:.4f}; expected 2. "
+            "This indicates a degenerate mesh face or a vertex landing exactly "
+            "on the slice plane."
+        )
+        segments.append((crossings[0], crossings[1]))
 
-    return total if count > 0 else None
+    if not segments:
+        return []
+
+    # Stitch segments into closed contours by matching endpoints.
+    # Two segments belong to the same contour if they share a crossing point;
+    # each crossing point is the meeting of exactly two adjacent triangles.
+    # We use spatial hashing rather than exact equality because floating-point
+    # interpolation can produce points that are equal in principle but differ
+    # by ~1e-9 metres in practice.
+    SCALE = 1e6  # quantise to micrometres — well below mesh resolution
+    def key(p: np.ndarray) -> tuple[int, int, int]:
+        return (int(round(p[0] * SCALE)), int(round(p[1] * SCALE)), int(round(p[2] * SCALE)))
+
+    # Build adjacency: each crossing-point key maps to the set of segments that touch it.
+    point_to_segments: dict[tuple[int, int, int], list[int]] = {}
+    for seg_idx, (a, b) in enumerate(segments):
+        for p in (a, b):
+            point_to_segments.setdefault(key(p), []).append(seg_idx)
+
+    # Walk segments to assemble contours via shared endpoints.
+    visited = [False] * len(segments)
+    contour_perimeters: list[float] = []
+
+    for start in range(len(segments)):
+        if visited[start]:
+            continue
+        # Walk a contour starting from segment `start`.
+        current = start
+        visited[current] = True
+        a, b = segments[current]
+        perimeter = float(np.linalg.norm(b - a))
+        last_endpoint = b
+
+        while True:
+            neighbours = point_to_segments.get(key(last_endpoint), [])
+            next_seg = None
+            for n in neighbours:
+                if n != current and not visited[n]:
+                    next_seg = n
+                    break
+            if next_seg is None:
+                break
+            visited[next_seg] = True
+            a, b = segments[next_seg]
+            # The shared point may be at either end of the next segment;
+            # advance to whichever endpoint is *not* the shared one.
+            if key(a) == key(last_endpoint):
+                perimeter += float(np.linalg.norm(b - a))
+                last_endpoint = b
+            else:
+                perimeter += float(np.linalg.norm(a - b))
+                last_endpoint = a
+            current = next_seg
+
+        contour_perimeters.append(perimeter)
+
+    return contour_perimeters
+
+
+def cross_section_perimeter(vertices: np.ndarray, faces: np.ndarray, y: float) -> float | None:
+    """Perimeter of the largest closed contour at horizontal slice Y=y.
+
+    Returns the largest contour because for horizontal slices through the
+    torso (chest/waist/hip range), the largest contour is always the body
+    trunk. Smaller contours at the same height — e.g. through grazed upper
+    arms when the slice drifts high — are correctly excluded rather than
+    summed into the result.
+
+    Returns None if the plane misses the mesh entirely.
+    """
+    perimeters = _contour_perimeters(vertices, faces, y)
+    if not perimeters:
+        return None
+    return max(perimeters)
 
 
 def measure(vertices: np.ndarray, joints: np.ndarray, faces: np.ndarray) -> dict:
     """
     Returns measurements in metres.
 
-    Anatomical slice heights:
-      chest  → midpoint between Spine_3 and Neck  (upper-torso / pectoral level)
-      waist  → Spine_2                             (narrowest trunk section)
-      hips   → mean of L_Hip / R_Hip joints        (widest lower-body section)
+    Slice heights are derived from joint positions in T-pose. See MEASUREMENTS.md
+    §4 for the anatomical caveats — these are SMPL-X skinning anchors, not
+    anatomical landmarks, and approximate (not specify) the named regions.
+
+    Slice heights:
+      chest  → midpoint between spine2 and spine3  (~71–74% of stature)
+      waist  → spine1                              (~58–62% of stature)
+      hips   → mean of L_Hip / R_Hip               (~50–53% of stature)
+
+    These slice positions were corrected from an earlier version that placed
+    chest at (spine3+neck)/2 (~83% of stature, clavicle level) and waist at
+    spine2 (~67% of stature, lower thorax). The clavicle level is the widest
+    upper-body cross-section in males due to trapezius and shoulder-blade
+    geometry, producing systematic +50–100 mm errors on chest. Both heights
+    have been corrected.
+
+    Linear measurements (shoulder width, arm length, arm span) use joint
+    positions directly. NOTE that shoulder_width here is glenohumeral-to-
+    glenohumeral distance, NOT biacromial breadth — it under-reads true
+    shoulder width by 60–100 mm. See MEASUREMENTS.md §5.
     """
+    # Stature: vertical extent from highest vertex (cranium) to lowest (heel).
+    # SMPL-X has no hair geometry, so the top vertex matches stadiometer height.
     height = float(vertices[:, 1].max() - vertices[:, 1].min())
 
-    y_chest = float((joints[SPINE_3, 1] + joints[NECK, 1]) / 2)
-    y_waist = float(joints[SPINE_2, 1])
+    # Circumference slice heights in metres (SMPL-X Y-axis is up).
+    y_chest = float((joints[SPINE_2, 1] + joints[SPINE_3, 1]) / 2)
+    y_waist = float(joints[SPINE_1, 1])
     y_hips  = float((joints[L_HIP, 1] + joints[R_HIP, 1]) / 2)
 
-    # Shoulder width: horizontal distance between shoulder joints
+    # Shoulder width: lateral (X-axis) distance between glenohumeral joint
+    # centres. Under-reads biacromial breadth — apply +60 to +90 mm offset
+    # for downstream garment-sizing if biacromial is needed.
     shoulder_width = float(abs(joints[L_SHOULDER, 0] - joints[R_SHOULDER, 0]))
 
-    # Arm span: wrist-to-wrist (T-pose arms are horizontal)
+    # Arm span: wrist-to-wrist X-axis distance. T-pose places arms horizontal
+    # and lateral, so X distance equals straight-line wrist separation.
+    # NOTE: This is wrist-to-wrist span, NOT fingertip-to-fingertip arm span
+    # as commonly defined in anthropometry.
     arm_span = float(abs(joints[L_WRIST, 0] - joints[R_WRIST, 0]))
 
+    # Per-arm length: 3D Euclidean distance from shoulder to wrist along the
+    # T-pose arm. Useful for sleeve sizing where arm-span (wrist-to-wrist)
+    # alone doesn't help. Computed as 3D norm rather than X-only because
+    # SMPL-X T-pose arms are not always perfectly horizontal — there can be
+    # small Y/Z offsets due to the canonical pose's slight arm droop.
+    arm_length_left  = float(np.linalg.norm(joints[L_WRIST] - joints[L_SHOULDER]))
+    arm_length_right = float(np.linalg.norm(joints[R_WRIST] - joints[R_SHOULDER]))
+
     return {
-        "height":         height,
-        "chest":          cross_section_perimeter(vertices, faces, y_chest),
-        "waist":          cross_section_perimeter(vertices, faces, y_waist),
-        "hips":           cross_section_perimeter(vertices, faces, y_hips),
-        "shoulder_width": shoulder_width,
-        "arm_span":       arm_span,
+        "height":           height,
+        "chest":            cross_section_perimeter(vertices, faces, y_chest),
+        "waist":            cross_section_perimeter(vertices, faces, y_waist),
+        "hips":             cross_section_perimeter(vertices, faces, y_hips),
+        "shoulder_width":   shoulder_width,
+        "arm_span":         arm_span,
+        "arm_length_left":  arm_length_left,
+        "arm_length_right": arm_length_right,
     }
+
+
+def reject_betas_outliers(
+    all_betas: np.ndarray, sigma_threshold: float = 2.0
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Reject detections whose `betas` deviate from the median by more than
+    `sigma_threshold` standard deviations in any dimension.
+
+    Why median+std rather than mean+std: a single bad detection (wrong
+    bounding box, failed regression) can produce extreme `betas` that would
+    inflate the mean and the standard deviation, masking itself as inlier.
+    Median is robust; using it as the centre and population-std as the scale
+    is a standard robust-rejection recipe.
+
+    Returns:
+        cleaned_betas: (N_kept, 10) array of accepted detections
+        accepted_mask: (N_total,) boolean mask, True for kept detections
+    """
+    median = np.median(all_betas, axis=0)
+    std = np.std(all_betas, axis=0)
+    # Avoid division by zero on dimensions where all detections agree exactly
+    # (rare but possible for synthetic test inputs).
+    std_safe = np.where(std > 1e-9, std, 1e-9)
+    z = np.abs(all_betas - median) / std_safe
+    # Accept only detections within threshold on EVERY betas dimension —
+    # one bad dimension is enough to suspect the whole detection.
+    accepted = (z < sigma_threshold).all(axis=1)
+    return all_betas[accepted], accepted
 
 
 def load_betas(npz_path: str) -> np.ndarray:
@@ -247,7 +455,9 @@ def print_stats(label: str, values_m: list, gt_mm: float | None = None) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Body measurement averages from SMPLer-X results")
+    parser = argparse.ArgumentParser(
+        description="Body measurement averages from SMPLer-X / SMPLest-X results"
+    )
     parser.add_argument("results_dir", help="Path to demo/results/{VIDEO_NAME}/")
     _repo_root = os.path.dirname(os.path.abspath(__file__))
     _default_model_path = os.path.join(_repo_root, "common", "utils", "human_model_files")
@@ -255,27 +465,58 @@ def main():
                         help="Path to SMPL-X model files")
     parser.add_argument("--gender", default="neutral", choices=["neutral", "male", "female"],
                         help="Body model gender (default: neutral)")
-    parser.add_argument("--mean_betas", action="store_true",
-                        help="Also show measurements for the mean betas across all detections")
+    parser.add_argument(
+        "--aggregation",
+        default="median_betas",
+        choices=["median_betas", "mean_betas", "per_frame"],
+        help=(
+            "How to produce the canonical per-subject measurement. "
+            "'median_betas' (default, recommended): take median of `betas` "
+            "across detections after 2-sigma outlier rejection, then measure "
+            "once. Robust to bad frames. "
+            "'mean_betas': arithmetic mean of `betas`, no rejection. Less "
+            "robust but matches the original behaviour. "
+            "'per_frame': measure each detection independently and average "
+            "the measurements. Discouraged — hides correlated per-frame errors."
+        ),
+    )
+    parser.add_argument(
+        "--sigma-threshold",
+        type=float,
+        default=2.0,
+        help=(
+            "Z-score threshold for `betas` outlier rejection in median_betas "
+            "mode. Detections with any betas dimension more than this many "
+            "standard deviations from the median are rejected. Default: 2.0."
+        ),
+    )
     parser.add_argument("--no-plot", dest="no_plot", action="store_true",
                         help="Skip saving the measurements plot")
     parser.add_argument("--rolling-window", type=int, default=30, metavar="N",
                         help="Rolling mean window size for the plot (default: 30)")
-    parser.add_argument("--ground-truth", default="1815,1070,990,1040,470,1400",
-                        metavar="H,C,W,HP,SH,AR",
-                        help="Ground truth in mm: height,chest,waist,hips,shoulders,arms "
-                             "(default: 1815,1070,990,1040,470,1400)")
+    parser.add_argument(
+        "--ground-truth",
+        default="1815,1070,990,1040,470,1400",
+        metavar="H,C,W,HP,SH,AR",
+        help=(
+            "Ground truth in mm: height,chest,waist,hips,shoulders,arm_span "
+            "(default: 1815,1070,990,1040,470,1400)"
+        ),
+    )
     args = parser.parse_args()
 
     _gt_keys = ("height", "chest", "waist", "hips", "shoulder_width", "arm_span")
     try:
         _gt_vals = [float(x) for x in args.ground_truth.split(",")]
-        if len(_gt_vals) != 6:
+        if len(_gt_vals) != len(_gt_keys):
             raise ValueError
     except ValueError:
-        sys.exit("--ground-truth must be exactly 6 comma-separated numbers")
+        sys.exit(f"--ground-truth must be exactly {len(_gt_keys)} comma-separated numbers")
     ground_truth: dict[str, float] = dict(zip(_gt_keys, _gt_vals))
 
+    # ------------------------------------------------------------------
+    # Discover .npz detection files.
+    # ------------------------------------------------------------------
     smplx_dir = os.path.join(args.results_dir, "smplx")
     npz_files = sorted(glob.glob(os.path.join(smplx_dir, "*.npz")))
     if not npz_files:
@@ -287,10 +528,21 @@ def main():
     model.eval()
     faces = model.faces  # (N_faces, 3) int array
 
-    all_betas = []
+    # ------------------------------------------------------------------
+    # Pass 1: load all betas and compute per-frame measurements.
+    # We always populate per_detection (for the plot and per-frame
+    # statistics) even when --aggregation=median_betas, because the
+    # per-frame view is useful for diagnosing capture issues and for
+    # validating that the aggregation didn't hide a problem.
+    # ------------------------------------------------------------------
+    all_betas: list[np.ndarray] = []
     frame_indices: list[int] = []
     per_detection: dict[str, list[float]] = {
-        k: [] for k in ("height", "chest", "waist", "hips", "shoulder_width", "arm_span")
+        k: [] for k in (
+            "height", "chest", "waist", "hips",
+            "shoulder_width", "arm_span",
+            "arm_length_left", "arm_length_right",
+        )
     }
 
     for path in tqdm(npz_files, desc="Processing detections", unit="det"):
@@ -302,36 +554,73 @@ def main():
         for k in per_detection:
             per_detection[k].append(m[k])  # keep None to preserve per-detection alignment
 
+    all_betas_arr = np.array(all_betas)
     video_name = os.path.basename(os.path.normpath(args.results_dir))
 
+    # Output collection: print to stdout AND save to a .txt for later reference.
     lines: list[str] = []
 
     def emit(s: str = "") -> None:
         print(s)
         lines.append(s)
 
-    emit(f"\n=== Per-detection averages  [{video_name}  gender={args.gender}] ===")
+    emit(f"\n=== Per-detection statistics  [{video_name}  gender={args.gender}] ===")
     for key in per_detection:
         emit(format_stats(key, per_detection[key], gt_mm=ground_truth.get(key)))
 
+    # ------------------------------------------------------------------
+    # Pass 2: canonical per-subject measurement via the chosen aggregation.
+    # This is the number that should be reported as THE measurement for
+    # this subject. The per-frame statistics above are diagnostic.
+    # ------------------------------------------------------------------
+    if args.aggregation in ("median_betas", "mean_betas"):
+        if args.aggregation == "median_betas":
+            # Robust path: reject betas outliers, then take median.
+            cleaned, mask = reject_betas_outliers(all_betas_arr, args.sigma_threshold)
+            n_rejected = int((~mask).sum())
+            emit(
+                f"\n=== Median-betas aggregation "
+                f"(rejected {n_rejected}/{len(all_betas_arr)} detections at "
+                f"σ>{args.sigma_threshold}) ==="
+            )
+            if len(cleaned) == 0:
+                # Defensive: if rejection eliminated everything (very unusual),
+                # fall back to using all detections rather than failing silently.
+                emit(
+                    "  WARNING: outlier rejection removed all detections. "
+                    "Falling back to the full set. Consider raising --sigma-threshold."
+                )
+                cleaned = all_betas_arr
+            agg_betas = np.median(cleaned, axis=0)
+        else:  # mean_betas
+            emit("\n=== Mean-betas aggregation (no outlier rejection) ===")
+            agg_betas = np.mean(all_betas_arr, axis=0)
+
+        verts, joints = tpose_mesh(model, agg_betas)
+        m = measure(verts, joints, faces)
+        for key, val in m.items():
+            if val is None:
+                continue
+            gt_mm = ground_truth.get(key)
+            err_str = ""
+            if gt_mm is not None:
+                err = val * 1000 - gt_mm
+                err_str = f"  |  error vs GT: {err:+.1f} mm ({err / gt_mm * 100:+.1f}%)"
+            emit(f"  {key:<18}: {val * 1000:.1f} mm{err_str}")
+
+    elif args.aggregation == "per_frame":
+        # No second pass — the per-detection mean already shown above is the
+        # canonical answer in this mode. Discouraged, see argparse help.
+        emit("\n=== Per-frame aggregation (canonical = mean of per-frame measurements) ===")
+        emit("  See per-detection statistics block above.")
+
+    # ------------------------------------------------------------------
+    # Plot and save.
+    # ------------------------------------------------------------------
     if not args.no_plot:
         plot_path = os.path.join(args.results_dir, f"{video_name}.png")
         plot_measurements(frame_indices, per_detection, plot_path,
                           window=args.rolling_window, ground_truth=ground_truth)
-
-    if args.mean_betas:
-        mean_betas = np.mean(all_betas, axis=0)
-        verts, joints = tpose_mesh(model, mean_betas)
-        m = measure(verts, joints, faces)
-        emit("\n=== Mean-betas body (single representative person) ===")
-        for key, val in m.items():
-            if val is not None:
-                gt_mm = ground_truth.get(key)
-                err_str = ""
-                if gt_mm is not None:
-                    err = val * 1000 - gt_mm
-                    err_str = f"  |  error vs GT: {err:+.1f} mm ({err / gt_mm * 100:+.1f}%)"
-                emit(f"  {key:<18}: {val * 1000:.1f} mm{err_str}")
 
     txt_path = os.path.join(args.results_dir, f"{video_name}.txt")
     with open(txt_path, "w") as f:
