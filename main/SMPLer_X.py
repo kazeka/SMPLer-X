@@ -30,7 +30,7 @@ class Model(nn.Module):
         # face
         self.face_regressor = face_regressor
 
-        self.smplx_layer = copy.deepcopy(smpl_x.layer['neutral']).cuda()
+        self.smplx_layer = copy.deepcopy(smpl_x.layer['male']).cuda()
         self.coord_loss = CoordLoss()
         self.param_loss = ParamLoss()
         self.ce_loss = CELoss()

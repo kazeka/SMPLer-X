@@ -13,7 +13,7 @@ class SMPLX(object):
                         'female': smplx.create(cfg.human_model_path, 'smplx', gender='FEMALE', use_pca=False, use_face_contour=True, **self.layer_arg)
                         }
         self.vertex_num = 10475
-        self.face = self.layer['neutral'].faces
+        self.face = self.layer['male'].faces
         self.shape_param_dim = 10
         self.expr_code_dim = 10
         with open(osp.join(cfg.human_model_path, 'smplx', 'SMPLX_to_J14.pkl'), 'rb') as f:
@@ -21,7 +21,7 @@ class SMPLX(object):
         with open(osp.join(cfg.human_model_path, 'smplx', 'MANO_SMPLX_vertex_ids.pkl'), 'rb') as f:
             self.hand_vertex_idx = pickle.load(f, encoding='latin1')
         self.face_vertex_idx = np.load(osp.join(cfg.human_model_path, 'smplx', 'SMPL-X__FLAME_vertex_ids.npy'))
-        self.J_regressor = self.layer['neutral'].J_regressor.numpy()
+        self.J_regressor = self.layer['male'].J_regressor.numpy()
         self.J_regressor_idx = {'pelvis': 0, 'lwrist': 20, 'rwrist': 21, 'neck': 12}
         self.orig_hand_regressor = self.make_hand_regressor()
         #self.orig_hand_regressor = {'left': self.layer.J_regressor.numpy()[[20,37,38,39,25,26,27,28,29,30,34,35,36,31,32,33],:], 'right': self.layer.J_regressor.numpy()[[21,52,53,54,40,41,42,43,44,45,49,50,51,46,47,48],:]}
@@ -117,7 +117,7 @@ class SMPLX(object):
                                         self.pos_joints_name.index('R_Pinky_1') - len(self.pos_joint_part['body']) - len(self.pos_joint_part['lhand'])]
     
     def make_hand_regressor(self):
-        regressor = self.layer['neutral'].J_regressor.numpy()
+        regressor = self.layer['male'].J_regressor.numpy()
         lhand_regressor = np.concatenate((regressor[[20,37,38,39],:],
                                             np.eye(self.vertex_num)[5361,None],
                                                 regressor[[25,26,27],:],
@@ -155,7 +155,7 @@ class SMPL(object):
         self.layer_arg = {'create_body_pose': False, 'create_betas': False, 'create_global_orient': False, 'create_transl': False}
         self.layer = {'neutral': smplx.create(cfg.human_model_path, 'smpl', gender='NEUTRAL', **self.layer_arg), 'male': smplx.create(cfg.human_model_path, 'smpl', gender='MALE', **self.layer_arg), 'female': smplx.create(cfg.human_model_path, 'smpl', gender='FEMALE', **self.layer_arg)}
         self.vertex_num = 6890
-        self.face = self.layer['neutral'].faces
+        self.face = self.layer['male'].faces
         self.shape_param_dim = 10
         self.vposer_code_dim = 32
 
@@ -164,7 +164,7 @@ class SMPL(object):
         self.orig_joints_name = ('Pelvis', 'L_Hip', 'R_Hip', 'Spine_1', 'L_Knee', 'R_Knee', 'Spine_2', 'L_Ankle', 'R_Ankle', 'Spine_3', 'L_Foot', 'R_Foot', 'Neck', 'L_Collar', 'R_Collar', 'Head', 'L_Shoulder', 'R_Shoulder', 'L_Elbow', 'R_Elbow', 'L_Wrist', 'R_Wrist', 'L_Hand', 'R_Hand')
         self.orig_flip_pairs = ( (1,2), (4,5), (7,8), (10,11), (13,14), (16,17), (18,19), (20,21), (22,23) )
         self.orig_root_joint_idx = self.orig_joints_name.index('Pelvis')
-        self.orig_joint_regressor = self.layer['neutral'].J_regressor.numpy().astype(np.float32)
+        self.orig_joint_regressor = self.layer['male'].J_regressor.numpy().astype(np.float32)
         
         self.joint_num = self.orig_joint_num
         self.joints_name = self.orig_joints_name
