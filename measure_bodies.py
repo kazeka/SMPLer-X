@@ -68,7 +68,6 @@ SPINE_2     = 6   # ~65–70% of stature; lower thoracic / floating-rib level
 SPINE_3     = 9   # ~76–80% of stature; upper thoracic / scapular level
 NECK        = 12
 L_SHOULDER, R_SHOULDER = 16, 17
-L_ELBOW, R_ELBOW       = 18, 19
 L_WRIST, R_WRIST       = 20, 21
 
 
@@ -284,23 +283,13 @@ def measure(vertices: np.ndarray, joints: np.ndarray, faces: np.ndarray) -> dict
     # as commonly defined in anthropometry.
     arm_span = float(abs(joints[L_WRIST, 0] - joints[R_WRIST, 0]))
 
-    # Per-arm length: 3D Euclidean distance from shoulder to wrist along the
-    # T-pose arm. Useful for sleeve sizing where arm-span (wrist-to-wrist)
-    # alone doesn't help. Computed as 3D norm rather than X-only because
-    # SMPL-X T-pose arms are not always perfectly horizontal — there can be
-    # small Y/Z offsets due to the canonical pose's slight arm droop.
-    arm_length_left  = float(np.linalg.norm(joints[L_WRIST] - joints[L_SHOULDER]))
-    arm_length_right = float(np.linalg.norm(joints[R_WRIST] - joints[R_SHOULDER]))
-
     return {
-        "height":           height,
-        "chest":            cross_section_perimeter(vertices, faces, y_chest),
-        "waist":            cross_section_perimeter(vertices, faces, y_waist),
-        "hips":             cross_section_perimeter(vertices, faces, y_hips),
-        "shoulder_width":   shoulder_width,
-        "arm_span":         arm_span,
-        "arm_length_left":  arm_length_left,
-        "arm_length_right": arm_length_right,
+        "height":         height,
+        "chest":          cross_section_perimeter(vertices, faces, y_chest),
+        "waist":          cross_section_perimeter(vertices, faces, y_waist),
+        "hips":           cross_section_perimeter(vertices, faces, y_hips),
+        "shoulder_width": shoulder_width,
+        "arm_span":       arm_span,
     }
 
 
@@ -541,7 +530,6 @@ def main():
         k: [] for k in (
             "height", "chest", "waist", "hips",
             "shoulder_width", "arm_span",
-            "arm_length_left", "arm_length_right",
         )
     }
 
