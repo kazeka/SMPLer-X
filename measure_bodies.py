@@ -40,7 +40,7 @@ L_SHOULDER, R_SHOULDER = 16, 17
 L_WRIST, R_WRIST       = 20, 21
 
 
-def load_smplx(model_path: str):
+def load_smplx(model_path: str, gender: str = "neutral"):
     try:
         import smplx
     except ImportError:
@@ -51,7 +51,7 @@ def load_smplx(model_path: str):
     smplx_dir = os.path.join(model_path, "smplx")
     return smplx.SMPLX(
         smplx_dir,
-        gender="neutral",
+        gender=gender,
         num_betas=10,
         use_face_contour=True,
         use_pca=False,
@@ -244,6 +244,8 @@ def main():
     _default_model_path = os.path.join(_repo_root, "common", "utils", "human_model_files")
     parser.add_argument("--model_path", default=_default_model_path,
                         help="Path to SMPL-X model files")
+    parser.add_argument("--gender", default="neutral", choices=["neutral", "male", "female"],
+                        help="Body model gender (default: neutral)")
     parser.add_argument("--mean_betas", action="store_true",
                         help="Also show measurements for the mean betas across all detections")
     parser.add_argument("--no-plot", dest="no_plot", action="store_true",
@@ -272,7 +274,7 @@ def main():
 
     print(f"Loading {len(npz_files)} detections from {smplx_dir}")
 
-    model = load_smplx(args.model_path)
+    model = load_smplx(args.model_path, gender=args.gender)
     model.eval()
     faces = model.faces  # (N_faces, 3) int array
 
