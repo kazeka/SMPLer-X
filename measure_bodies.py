@@ -135,11 +135,29 @@ def frame_index(npz_path: str) -> int:
     return int(os.path.basename(npz_path).split("_")[0])
 
 
+def _scatter_rolling(ax, frames, vals_mm, window, scatter_label, color="steelblue"):
+    ax.scatter(frames, vals_mm, s=4, alpha=0.35, color=color, label=scatter_label)
+    order = np.argsort(frames)
+    f_s, v_s = frames[order], vals_mm[order]
+    if len(v_s) >= window:
+        rolling = np.convolve(v_s, np.ones(window) / window, mode="valid")
+        ax.plot(f_s[window - 1:], rolling, color="crimson", linewidth=1.5,
+                label=f"rolling mean (w={window})")
+
+
+def _finish_subplots(axes, n, ncols, nrows):
+    for ax in axes[n:]:
+        ax.set_visible(False)
+    for ax in axes[(nrows - 1) * ncols: n]:
+        ax.set_xlabel("frame index")
+
+
 def plot_measurements(
     frame_indices: list[int],
-    per_detection: dict[str, list[float]],
+    per_detection: dict[str, list],
     save_path: str,
     window: int = 30,
+    ground_truth: dict[str, float] | None = None,
 ) -> None:
     keys = list(per_detection.keys())
     n = len(keys)
@@ -147,40 +165,70 @@ def plot_measurements(
     nrows = (n + 1) // ncols
     fig, axes = plt.subplots(nrows, ncols, figsize=(14, nrows * 3), sharex=True)
     axes = axes.flatten()
-
     frames = np.array(frame_indices)
 
     for ax, key in zip(axes, keys):
-        vals_mm = np.array(per_detection[key]) * 1000
-        ax.scatter(frames, vals_mm, s=4, alpha=0.35, color="steelblue", label="per detection")
-
-        # rolling mean (sorted by frame index)
-        order = np.argsort(frames)
-        f_sorted = frames[order]
-        v_sorted = vals_mm[order]
-        if len(v_sorted) >= window:
-            kernel = np.ones(window) / window
-            rolling = np.convolve(v_sorted, kernel, mode="valid")
-            ax.plot(f_sorted[window - 1:], rolling, color="crimson", linewidth=1.5, label=f"rolling mean (w={window})")
-
+        raw = per_detection[key]
+        valid = np.array([v is not None for v in raw])
+        vals_mm = np.array([v * 1000 if v is not None else np.nan for v in raw], dtype=float)
+        _scatter_rolling(ax, frames[valid], vals_mm[valid], window, "per detection")
+        if ground_truth and key in ground_truth:
+            ax.axhline(ground_truth[key], color="limegreen", linewidth=1.5,
+                       linestyle="--", label="ground truth")
         ax.set_title(key.replace("_", " ").title())
         ax.set_ylabel("mm")
         ax.legend(fontsize=7, loc="upper right")
         ax.grid(True, linewidth=0.4, alpha=0.5)
 
-    for ax in axes[n:]:
-        ax.set_visible(False)
-
-    for ax in axes[(nrows - 1) * ncols: n]:
-        ax.set_xlabel("frame index")
-
+    _finish_subplots(axes, n, ncols, nrows)
     fig.suptitle("Body measurements vs frame index", fontsize=13, y=1.01)
     fig.tight_layout()
     fig.savefig(save_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
     print(f"Plot saved to {save_path}")
 
+    if not (ground_truth and "height" in ground_truth):
+        return
 
-def print_stats(label: str, values_m: list[float]) -> None:
+    # Height-adjusted figure: scale each detection's measurements by gt_height / measured_height
+    gt_h = ground_truth["height"]
+    heights_mm = np.array(
+        [v * 1000 if v is not None else np.nan for v in per_detection["height"]], dtype=float
+    )
+    k_arr = gt_h / heights_mm  # per-detection coefficient
+
+    adj_keys = [k for k in keys if k != "height"]
+    n_adj = len(adj_keys)
+    nrows_adj = (n_adj + 1) // ncols
+    fig2, axes2 = plt.subplots(nrows_adj, ncols, figsize=(14, nrows_adj * 3), sharex=True)
+    axes2 = axes2.flatten()
+
+    for ax, key in zip(axes2, adj_keys):
+        raw = per_detection[key]
+        valid = np.array([v is not None for v in raw])
+        vals_mm = np.array([v * 1000 if v is not None else np.nan for v in raw], dtype=float)
+        adj_mm = vals_mm * k_arr
+        _scatter_rolling(ax, frames[valid], adj_mm[valid], window,
+                         "height-adjusted", color="mediumpurple")
+        if ground_truth and key in ground_truth:
+            ax.axhline(ground_truth[key], color="limegreen", linewidth=1.5,
+                       linestyle="--", label="ground truth")
+        ax.set_title(f"{key.replace('_', ' ').title()} (height-adjusted)")
+        ax.set_ylabel("mm")
+        ax.legend(fontsize=7, loc="upper right")
+        ax.grid(True, linewidth=0.4, alpha=0.5)
+
+    _finish_subplots(axes2, n_adj, ncols, nrows_adj)
+    fig2.suptitle("Height-adjusted body measurements vs frame index", fontsize=13, y=1.01)
+    fig2.tight_layout()
+    adj_path = save_path.replace(".png", "_height_adjusted.png")
+    fig2.savefig(adj_path, dpi=120, bbox_inches="tight")
+    plt.close(fig2)
+    print(f"Plot saved to {adj_path}")
+
+
+def print_stats(label: str, values_m: list) -> None:
+    values_m = [v for v in values_m if v is not None]
     if not values_m:
         print(f"  {label:<18}: no data")
         return
@@ -202,7 +250,20 @@ def main():
                         help="Skip saving the measurements plot")
     parser.add_argument("--rolling-window", type=int, default=30, metavar="N",
                         help="Rolling mean window size for the plot (default: 30)")
+    parser.add_argument("--ground-truth", default="1815,1070,990,1040,470,1400",
+                        metavar="H,C,W,HP,SH,AR",
+                        help="Ground truth in mm: height,chest,waist,hips,shoulders,arms "
+                             "(default: 1815,1070,990,1040,470,1400)")
     args = parser.parse_args()
+
+    _gt_keys = ("height", "chest", "waist", "hips", "shoulder_width", "arm_span")
+    try:
+        _gt_vals = [float(x) for x in args.ground_truth.split(",")]
+        if len(_gt_vals) != 6:
+            raise ValueError
+    except ValueError:
+        sys.exit("--ground-truth must be exactly 6 comma-separated numbers")
+    ground_truth: dict[str, float] = dict(zip(_gt_keys, _gt_vals))
 
     smplx_dir = os.path.join(args.results_dir, "smplx")
     npz_files = sorted(glob.glob(os.path.join(smplx_dir, "*.npz")))
@@ -227,17 +288,18 @@ def main():
         frame_indices.append(frame_index(path))
         verts, joints = tpose_mesh(model, betas)
         m = measure(verts, joints, faces)
-        for k, v in m.items():
-            if v is not None:
-                per_detection[k].append(v)
+        for k in per_detection:
+            per_detection[k].append(m[k])  # keep None to preserve per-detection alignment
 
     print("\n=== Per-detection averages ===")
     for key in per_detection:
         print_stats(key, per_detection[key])
 
     if not args.no_plot:
-        plot_path = os.path.join(args.results_dir, "measurements.png")
-        plot_measurements(frame_indices, per_detection, plot_path, window=args.rolling_window)
+        video_name = os.path.basename(os.path.normpath(args.results_dir))
+        plot_path = os.path.join(args.results_dir, f"{video_name}.png")
+        plot_measurements(frame_indices, per_detection, plot_path,
+                          window=args.rolling_window, ground_truth=ground_truth)
 
     if args.mean_betas:
         mean_betas = np.mean(all_betas, axis=0)
