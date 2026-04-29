@@ -227,14 +227,23 @@ def plot_measurements(
     print(f"Plot saved to {adj_path}")
 
 
-def print_stats(label: str, values_m: list) -> None:
+def format_stats(label: str, values_m: list, gt_mm: float | None = None) -> str:
     values_m = [v for v in values_m if v is not None]
     if not values_m:
-        print(f"  {label:<18}: no data")
-        return
-    arr = np.array(values_m) * 1000  # → mm
-    print(f"  {label:<18}: {arr.mean():.1f} mm  ±{arr.std():.1f}  "
-          f"[{arr.min():.1f} – {arr.max():.1f}]  n={len(arr)}")
+        return f"  {label:<18}: no data"
+    arr = np.array(values_m) * 1000
+    line = (f"  {label:<18}: {arr.mean():.1f} mm  ±{arr.std():.1f}  "
+            f"[{arr.min():.1f} – {arr.max():.1f}]  n={len(arr)}")
+    if gt_mm is not None:
+        err = arr.mean() - gt_mm
+        line += f"  |  error vs GT: {err:+.1f} mm ({err / gt_mm * 100:+.1f}%)"
+    return line
+
+
+def print_stats(label: str, values_m: list, gt_mm: float | None = None) -> str:
+    line = format_stats(label, values_m, gt_mm)
+    print(line)
+    return line
 
 
 def main():
@@ -293,12 +302,19 @@ def main():
         for k in per_detection:
             per_detection[k].append(m[k])  # keep None to preserve per-detection alignment
 
-    print("\n=== Per-detection averages ===")
+    video_name = os.path.basename(os.path.normpath(args.results_dir))
+
+    lines: list[str] = []
+
+    def emit(s: str = "") -> None:
+        print(s)
+        lines.append(s)
+
+    emit(f"\n=== Per-detection averages  [{video_name}  gender={args.gender}] ===")
     for key in per_detection:
-        print_stats(key, per_detection[key])
+        emit(format_stats(key, per_detection[key], gt_mm=ground_truth.get(key)))
 
     if not args.no_plot:
-        video_name = os.path.basename(os.path.normpath(args.results_dir))
         plot_path = os.path.join(args.results_dir, f"{video_name}.png")
         plot_measurements(frame_indices, per_detection, plot_path,
                           window=args.rolling_window, ground_truth=ground_truth)
@@ -307,10 +323,20 @@ def main():
         mean_betas = np.mean(all_betas, axis=0)
         verts, joints = tpose_mesh(model, mean_betas)
         m = measure(verts, joints, faces)
-        print("\n=== Mean-betas body (single representative person) ===")
+        emit("\n=== Mean-betas body (single representative person) ===")
         for key, val in m.items():
             if val is not None:
-                print(f"  {key:<18}: {val * 1000:.1f} mm")
+                gt_mm = ground_truth.get(key)
+                err_str = ""
+                if gt_mm is not None:
+                    err = val * 1000 - gt_mm
+                    err_str = f"  |  error vs GT: {err:+.1f} mm ({err / gt_mm * 100:+.1f}%)"
+                emit(f"  {key:<18}: {val * 1000:.1f} mm{err_str}")
+
+    txt_path = os.path.join(args.results_dir, f"{video_name}.txt")
+    with open(txt_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"Results saved to {txt_path}")
 
 
 if __name__ == "__main__":
